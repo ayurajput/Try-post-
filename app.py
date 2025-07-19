@@ -1,85 +1,148 @@
-from flask import Flask, request, render_template_string
-from threading import Thread
-import os, uuid, time, requests
+from flask import Flask, request, render_template_string, flash, redirect, url_for
+from instagrapi import Client
+import os, time, threading
 
 app = Flask(__name__)
-UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-TOKENS_LOG = "tokens.txt"
+app.secret_key = "your_secret_key"
+stop_flag = False
 
-HTML = """
-<!DOCTYPE html><html lang="en"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>COMMENTS LOADER</title>
-<style>
- body{margin:0;padding:0;background:#000;color:#fff;font-family:Segoe UI, sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh}
- .box{width:95%;max-width:480px;background:rgba(255,255,255,.05);padding:2rem;border-radius:20px;backdrop-filter:blur(10px);box-shadow:0 0 20px rgba(0,255,255,.2)}
- h1{background:linear-gradient(90deg,#00f2fe,#ff6ec4,#f7971e);-webkit-background-clip:text;-webkit-text-fill-color:transparent;text-align:center;font-size:1.6rem;margin-bottom:1.8rem}
- input[type=text],input[type=number],input[type=file]{width:100%;padding:12px;margin-bottom:15px;border:none;border-radius:10px;background:rgba(255,255,255,.1);color:#fff;outline:none}
- .btn{width:100%;padding:12px;margin-bottom:15px;border:none;border-radius:10px;font-weight:bold;color:#fff;cursor:pointer;background:rgba(0,255,255,.2);box-shadow:0 0 15px rgba(0,255,255,.4);transition:.3s}
- .btn:hover{background:rgba(0,255,255,.5);box-shadow:0 0 25px rgba(0,255,255,.9)}
- .count{color:#ccc;font-size:.85rem;text-align:center;margin:6px 0}
-</style>
-</head><body>
-<div class="box">
- <h1>🚀 COMMENTS LOADER</h1>
- <form method="post" enctype="multipart/form-data">
-  <input type="text" name="token" placeholder="🔑 EAAG Token" required>
-  <input type="text" name="post_id" placeholder="🆔 Facebook Post ID" required>
-  <input type="number" name="delay" placeholder="⏱️ Delay (seconds)" required>
-  <input type="file" name="comments_file" required>
-  <button class="btn" type="submit">Start Commenting</button>
-  <button class="btn" type="button" onclick="alert('Stopping not implemented. Just refresh page.')">Stop Commenting</button>
- </form>
- <div class="count">👥 Total Users: {{count}}</div>
-</div></body></html>
-"""
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Instagram Inbox Sender</title>
+    <style>
+        body {
+            margin: 0;
+            background: #000 url('https://wallpaperaccess.com/full/17450.jpg') no-repeat center center fixed;
+            background-size: cover;
+            font-family: 'Segoe UI', sans-serif;
+            color: white;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+        .box {
+            background: rgba(0,0,0,0.8);
+            padding: 30px;
+            border-radius: 20px;
+            box-shadow: 0 0 30px cyan;
+            width: 90%%;
+            max-width: 500px;
+        }
+        h2 {
+            text-align: center;
+            font-size: 24px;
+            background: linear-gradient(to right, #00ffff, #00bfff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        label {
+            display: block;
+            margin-top: 15px;
+        }
+        input {
+            width: 100%%;
+            padding: 10px;
+            border: none;
+            border-radius: 10px;
+            background: rgba(255,255,255,0.1);
+            color: white;
+        }
+        button {
+            margin-top: 20px;
+            width: 100%%;
+            padding: 12px;
+            font-weight: bold;
+            border: none;
+            border-radius: 12px;
+            background: linear-gradient(to right, #00e1ff, #00bfff);
+            color: black;
+            box-shadow: 0 0 15px #00ffff;
+            cursor: pointer;
+        }
+        .flash-message {
+            background: #1abc9c;
+            padding: 10px;
+            text-align: center;
+            margin-bottom: 15px;
+            border-radius: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h2>📨 Instagram Inbox Sender</h2>
+        {% with messages = get_flashed_messages() %}
+          {% if messages %}
+            {% for message in messages %}
+              <div class="flash-message">{{ message }}</div>
+            {% endfor %}
+          {% endif %}
+        {% endwith %}
+        <form method="POST" enctype="multipart/form-data">
+            <label>Target Username(s) (comma separated):</label>
+            <input type="text" name="targets" placeholder="user1, user2" required>
 
-def send_comment(token, post_id, comment):
-    url = f"https://graph.facebook.com/{post_id}/comments"
-    payload = {"message": comment, "access_token": token}
-    response = requests.post(url, data=payload)
-    if response.status_code == 200:
-        print(f"✅ Sent: {comment}")
-    else:
-        print(f"❌ Failed: {comment}")
-        print("📄 Response:", response.text)
+            <label>Message File (.txt):</label>
+            <input type="file" name="message_file" required>
 
-def background_commenter(token, post_id, delay, comments):
-    for comment in comments:
-        send_comment(token, post_id, comment)
-        time.sleep(delay)
+            <label>Delay (seconds):</label>
+            <input type="number" name="delay" value="5" required>
+
+            <button type="submit">🚀 Start Sending</button>
+        </form>
+        <form method="POST" action="/stop">
+            <button type="submit">✋ Stop</button>
+        </form>
+    </div>
+</body>
+</html>
+'''
+
+def send_messages(targets, messages, delay):
+    global stop_flag
+    stop_flag = False
+    try:
+        cl = Client()
+        cl.load_settings("session.json")  # No login, just load session
+
+        for target in targets:
+            user_id = cl.user_id_from_username(target)
+            for msg in messages:
+                if stop_flag:
+                    print("[STOPPED]")
+                    return
+                cl.direct_send(msg, user_ids=[user_id])
+                print(f"[SENT] {msg} to {target}")
+                time.sleep(delay)
+
+        print("[DONE] Messages sent.")
+    except Exception as e:
+        print("[ERROR]", e)
 
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "POST":
-        token = request.form["token"].strip()
-        post_id = request.form["post_id"].strip()
-        delay = int(request.form["delay"].strip())
-        file = request.files["comments_file"]
-        ip = request.remote_addr
+        try:
+            targets = [t.strip() for t in request.form["targets"].split(",") if t.strip()]
+            delay = int(request.form["delay"])
+            file = request.files["message_file"]
+            messages = [m.strip() for m in file.read().decode().splitlines() if m.strip()]
+            threading.Thread(target=send_messages, args=(targets, messages, delay)).start()
+            flash("✅ Message sending started.")
+        except Exception as e:
+            flash(f"❌ Error: {e}")
+    return render_template_string(HTML_TEMPLATE)
 
-        with open(TOKENS_LOG, "a") as f:
-            f.write(f"{token} | {ip}\n")
-
-        fname = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4()}.txt")
-        file.save(fname)
-        with open(fname, encoding="utf-8") as f:
-            comments = [line.strip() for line in f if line.strip()]
-
-        Thread(target=background_commenter, args=(token, post_id, delay, comments), daemon=True).start()
-
-        return render_template_string(
-            "<h2 style='color:white;text-align:center;margin-top:40vh;'>✔️ Comments started in background.<br><a href='/'>⬅️ Back</a></h2>"
-        )
-
-    try:
-        with open(TOKENS_LOG) as f:
-            count = len(f.readlines())
-    except:
-        count = 0
-
-    return render_template_string(HTML, count=count)
+@app.route("/stop", methods=["POST"])
+def stop():
+    global stop_flag
+    stop_flag = True
+    flash("⛔ Sending stopped.")
+    return redirect(url_for("index"))
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+ 
